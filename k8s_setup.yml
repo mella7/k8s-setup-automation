@@ -1,0 +1,145 @@
+---
+- name: Setup Kubernetes Cluster on Target Node
+  hosts: target-node
+  become: true
+  vars:
+    target_node_ip: "{{ target_node_ip }}"
+  tasks:
+    # Set SELinux to permissive
+    - name: Set SELinux to permissive
+      command: setenforce 0
+      ignore_errors: yes
+
+    - name: Update SELinux config
+      lineinfile:
+        path: /etc/selinux/config
+        regexp: '^SELINUX=enforcing'
+        line: 'SELINUX=permissive'
+
+    # Update system and install prerequisites
+    - name: Update and install required packages
+      yum:
+        name:
+          - yum-utils
+          - device-mapper-persistent-data
+          - lvm2
+          - curl
+          - jq
+        state: latest
+        update_cache: yes
+
+    # Disable swap
+    - name: Disable swap
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^/#/' /etc/fstab
+      args:
+        executable: /bin/bash
+
+    # Load kernel modules
+    - name: Enable kernel modules
+      shell: |
+        modprobe overlay
+        modprobe br_netfilter
+      args:
+        executable: /bin/bash
+
+    - name: Configure kernel modules to load on boot
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Configure sysctl settings for Kubernetes
+      copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+
+    - name: Apply sysctl settings
+      command: sysctl --system
+
+    # Add Docker repository and install containerd
+    - name: Add Docker repository
+      yum_repository:
+        name: docker
+        description: Docker Repository
+        baseurl: https://download.docker.com/linux/centos/docker-ce.repo
+        enabled: yes
+        gpgcheck: yes
+
+    - name: Install containerd
+      yum:
+        name: containerd.io
+        state: latest
+
+    - name: Configure containerd
+      shell: |
+        containerd config default | tee /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Restart and enable containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+    # Add Kubernetes repository and install components
+    - name: Add Kubernetes repository
+      copy:
+        dest: /etc/yum.repos.d/kubernetes.repo
+        content: |
+          [kubernetes]
+          name=Kubernetes
+          baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-\$basearch
+          enabled=1
+          gpgcheck=1
+          gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+          
+
+    - name: Install Kubernetes tools
+      yum:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Enable kubelet service
+      systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    # Initialize Kubernetes cluster
+    - name: Initialize Kubernetes cluster
+      shell: kubeadm init --pod-network-cidr=10.244.0.0/16
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    # Configure kubectl for ansible user
+    - name: Configure kubectl for ansible user
+      shell: |
+        mkdir -p /home/ansible/.kube
+        cp -i /etc/kubernetes/admin.conf /home/ansible/.kube/config
+        chown ansible:ansible /home/ansible/.kube/config
+      args:
+        executable: /bin/bash
+
+    # Install CNI plugin (Flannel)
+    - name: Install Flannel CNI
+      shell: kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+      args:
+        executable: /bin/bash
+
+    # Allow Kubernetes to schedule workloads on the control plane node
+    - name: Allow master to run workloads
+      shell: kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+      args:
+        executable: /bin/bash
+
